@@ -1,0 +1,36 @@
+services:
+  search:
+    build: .
+    image: runbook-search-api:local
+    environment:
+      SERVICE_NAME: runbook-search-api
+      APP_VERSION: 1.2.0-local
+      BUILD_REVISION: working-tree
+      ENVIRONMENT: local
+      IMAGE_DIGEST: local-build
+      RANKING_MODE: normal
+    ports: ["18080:8000"]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  bad-ranking:
+    profiles: ["negative"]
+    build: .
+    image: runbook-search-api:local
+    environment:
+      SERVICE_NAME: runbook-search-api
+      APP_VERSION: 1.2.0-local
+      BUILD_REVISION: working-tree
+      ENVIRONMENT: local-negative-control
+      IMAGE_DIGEST: local-build
+      RANKING_MODE: reverse
+    ports: ["18081:8000"]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+

@@ -1,0 +1,20 @@
+replicaCount: 1
+environment: staging # staging, production
+rankingMode: normal # normal, reverse
+buildRevision: unknown
+
+image:
+  repository: docker.io/valeblok/runbook-search-api
+  digest: ""
+  pullPolicy: IfNotPresent
+
+resources:
+  requests:
+    cpu: 150m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 1Gi
+
+service:
+  port: 80

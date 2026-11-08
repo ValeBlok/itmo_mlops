@@ -1,0 +1,15 @@
+.git
+.github
+.venv
+.pytest_cache
+**/__pycache__
+artifacts
+reports
+helm
+*.md
+*.kubeconfig
+kubeconfig*
+.env
+quality-report.json
+compose.yaml
+Makefile

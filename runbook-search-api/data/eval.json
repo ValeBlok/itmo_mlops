@@ -1,0 +1,11 @@
+[
+  {"query":"как вернуть предыдущую модель после плохого релиза","relevant":["doc-rollback"]},
+  {"query":"pod запущен но трафик на него не идет readiness","relevant":["doc-probes"]},
+  {"query":"как хранить пароль registry и ограничить права","relevant":["doc-security"]},
+  {"query":"почему HTTP 200 есть а поиск стал хуже","relevant":["doc-drift","doc-observability"]},
+  {"query":"один и тот же образ перенести из staging в production","relevant":["doc-ci","doc-container"]},
+  {"query":"реплики по загрузке процессора requests limits","relevant":["doc-scaling"]},
+  {"query":"связать модель данные commit и метрики","relevant":["doc-registry","doc-data"]},
+  {"query":"маленькая доля трафика новой версии модели","relevant":["doc-canary"]}
+]
+

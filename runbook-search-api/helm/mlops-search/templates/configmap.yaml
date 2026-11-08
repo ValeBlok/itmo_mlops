@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mlops-search.name" . }}
+  labels:
+    {{- include "mlops-search.labels" . | nindent 4 }}
+data:
+  SERVICE_NAME: "runbook-search-api"
+  APP_VERSION: {{ .Chart.AppVersion | quote }}
+  BUILD_REVISION: {{ .Values.buildRevision | toString | quote }}
+  ENVIRONMENT: {{ .Values.environment | quote }}
+  RANKING_MODE: {{ include "mlops-search.rankingMode" . | quote }}
+  IMAGE_DIGEST: {{ include "mlops-search.imageDigest" . | quote }}
+  IMAGE_REF: {{ include "mlops-search.image" . | quote }}

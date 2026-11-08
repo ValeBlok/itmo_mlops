@@ -1,0 +1,6 @@
+apiVersion: v2
+name: mlops-search
+description: Internal runbook retrieval API with an immutable search index
+type: application
+version: 0.1.0
+appVersion: "1.2.0"

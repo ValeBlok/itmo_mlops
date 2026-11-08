@@ -1,0 +1,101 @@
+name: production-rollback-drill
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Введите "rollback-drill", чтобы выкатить плохой release (rankingMode=reverse) в production'
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  HELM_DRIVER: configmap
+  HELM_VERSION: v3.19.0
+  KUBE_NAMESPACE: mlops-students
+  PROD_RELEASE: blokhina-search-prod
+
+jobs:
+  bad-release-drill:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    concurrency:
+      group: blokhina-search-prod
+      cancel-in-progress: false
+    steps:
+      - name: Confirm drill
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          [ "$CONFIRM" = "rollback-drill" ] || { echo "::error::type rollback-drill to confirm"; exit 1; }
+
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Configure kubeconfig from secret
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          if [ -z "$KUBE_CONFIG_B64" ]; then echo "::error::secret KUBE_CONFIG_B64 is not set"; exit 1; fi
+          umask 077
+          printf '%s' "$KUBE_CONFIG_B64" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Resolve current (good) production image
+        run: |
+          helm status "$PROD_RELEASE" -n "$KUBE_NAMESPACE" > /dev/null \
+            || { echo "::error::$PROD_RELEASE is not deployed; run the main pipeline first"; exit 1; }
+          values=$(helm get values "$PROD_RELEASE" -n "$KUBE_NAMESPACE" -o json)
+          repo=$(jq -r '.image.repository' <<< "$values")
+          digest=$(jq -r '.image.digest' <<< "$values")
+          rev=$(jq -r '.buildRevision // "unknown"' <<< "$values")
+          mode=$(jq -r '.rankingMode // "normal"' <<< "$values")
+          [ "$mode" = "normal" ] || { echo "::error::production is not in normal mode ($mode)"; exit 1; }
+          echo "current production: $repo@$digest (rankingMode=$mode)"
+          {
+            echo "IMAGE_REPOSITORY=$repo"
+            echo "IMAGE_DIGEST=$digest"
+            echo "BUILD_REVISION=$rev"
+          } >> "$GITHUB_ENV"
+
+      - name: Deploy bad candidate (rankingMode=reverse) with rollback guard
+        env:
+          RELEASE: ${{ env.PROD_RELEASE }}
+          ENVIRONMENT: production
+          RANKING_MODE: reverse
+          REPORT_DIR: reports/rollback-drill
+        run: |
+          set +e
+          ./scripts/deploy_release.sh
+          status=$?
+          set -e
+          case "$status" in
+            0) echo "::error::bad release PASSED semantic smoke - quality control is broken"; exit 1 ;;
+            1) echo "::notice::bad release blocked: helm rollback done, smoke re-run passed, rankingMode=normal restored" ;;
+            *) echo "::error::rollback did not recover production (exit $status)"; exit "$status" ;;
+          esac
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### helm history before"
+            echo '```'; cat reports/rollback-drill/helm-history-before.txt 2>/dev/null; echo '```'
+            echo "### helm history after"
+            echo '```'; cat reports/rollback-drill/helm-history-after.txt 2>/dev/null; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove kubeconfig
+        if: always()
+        run: rm -f "$RUNNER_TEMP/kubeconfig"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rollback-drill-evidence
+          path: reports/rollback-drill/

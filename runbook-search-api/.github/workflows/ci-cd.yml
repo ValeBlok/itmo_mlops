@@ -1,0 +1,277 @@
+name: mlops-search-ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  HELM_DRIVER: configmap
+  HELM_VERSION: v3.19.0
+  KUBE_NAMESPACE: mlops-students
+  STAGING_RELEASE: blokhina-search-staging
+  PROD_RELEASE: blokhina-search-prod
+  IMAGE_REPOSITORY: docker.io/${{ vars.DOCKERHUB_USERNAME || 'valeblok' }}/runbook-search-api
+
+jobs:
+  test-quality:
+    name: tests, model build, quality gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Build index (versioned model artifact)
+        run: |
+          mkdir -p reports
+          python scripts/build_index.py --output artifacts | tee reports/build-index.log
+
+      - name: Unit and platform contract tests
+        run: pytest -q
+
+      - name: Quality gate (MRR >= 0.85, Recall@3 >= 0.90)
+        run: python scripts/evaluate.py --artifact-dir artifacts --output reports/quality-report.json
+
+      - name: Negative quality control (reverse candidate must be blocked)
+        run: |
+          set +e
+          python scripts/evaluate.py --artifact-dir artifacts --ranking-mode reverse \
+            --output reports/negative-quality-report.json 2>&1 | tee reports/negative-quality-control.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ ! -s reports/negative-quality-report.json ]; then
+            echo "::error::negative control did not produce a quality report"; exit 1
+          fi
+          if [ "$status" -eq 0 ]; then
+            echo "::error::reverse candidate PASSED the quality gate"; exit 1
+          fi
+          echo "Reverse candidate blocked as expected (exit code $status)" | tee -a reports/negative-quality-control.log
+
+      - name: Helm lint and render
+        run: |
+          DUMMY=sha256:$(printf 'ci' | sha256sum | cut -d' ' -f1)
+          helm lint helm/mlops-search --set image.repository="$IMAGE_REPOSITORY" --set image.digest="$DUMMY"
+          helm template "$STAGING_RELEASE" helm/mlops-search -n "$KUBE_NAMESPACE" \
+            --set image.repository="$IMAGE_REPOSITORY" --set image.digest="$DUMMY" > /dev/null
+          if helm template "$STAGING_RELEASE" helm/mlops-search > /dev/null 2>&1; then
+            echo "::error::chart rendered without image.digest"; exit 1
+          fi
+
+      - name: Upload model metadata and quality reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-reports
+          path: |
+            artifacts/metadata.json
+            reports/
+          if-no-files-found: warn
+
+  build:
+    name: build/push image, resolve digest
+    needs: test-quality
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.resolve.outputs.digest }}
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: vars
+        run: echo "tag=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ vars.DOCKERHUB_USERNAME || 'valeblok' }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_REPOSITORY }}:${{ steps.vars.outputs.tag }}
+          build-args: |
+            BUILD_REVISION=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - id: resolve
+        name: Resolve and verify immutable digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          if ! [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::invalid digest '$DIGEST'"; exit 1
+          fi
+          docker buildx imagetools inspect "$IMAGE_REPOSITORY@$DIGEST" > /dev/null
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          mkdir -p reports
+          cat > reports/build-info.json <<EOF
+          {
+            "image_repository": "$IMAGE_REPOSITORY",
+            "tag": "$TAG",
+            "digest": "$DIGEST",
+            "image_ref": "$IMAGE_REPOSITORY@$DIGEST",
+            "git_sha": "$GITHUB_SHA"
+          }
+          EOF
+          cat reports/build-info.json
+          {
+            echo "### Image"
+            echo "- repository: \`$IMAGE_REPOSITORY\`"
+            echo "- tag: \`$TAG\`"
+            echo "- digest: \`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-info
+          path: reports/build-info.json
+
+  deploy-staging:
+    name: staging (Helm test + semantic smoke)
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+    concurrency:
+      group: blokhina-search-staging
+      cancel-in-progress: false
+    env:
+      IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Configure kubeconfig from secret
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          if [ -z "$KUBE_CONFIG_B64" ]; then echo "::error::secret KUBE_CONFIG_B64 is not set"; exit 1; fi
+          umask 077
+          printf '%s' "$KUBE_CONFIG_B64" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Check namespaced access
+        run: kubectl auth can-i get pods -n "$KUBE_NAMESPACE"
+
+      - name: Deploy staging (upgrade, helm test, semantic smoke, rollback on failure)
+        env:
+          RELEASE: ${{ env.STAGING_RELEASE }}
+          ENVIRONMENT: staging
+          RANKING_MODE: normal
+          BUILD_REVISION: ${{ github.sha }}
+          REPORT_DIR: reports/staging
+        run: ./scripts/deploy_release.sh
+
+      - name: Remove kubeconfig
+        if: always()
+        run: rm -f "$RUNNER_TEMP/kubeconfig"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: staging-evidence
+          path: reports/staging/
+
+  promote-production:
+    name: production (manual approval, same digest)
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    concurrency:
+      group: blokhina-search-prod
+      cancel-in-progress: false
+    env:
+      IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Configure kubeconfig from secret
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          if [ -z "$KUBE_CONFIG_B64" ]; then echo "::error::secret KUBE_CONFIG_B64 is not set"; exit 1; fi
+          umask 077
+          printf '%s' "$KUBE_CONFIG_B64" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Verify staging runs the digest being promoted
+        run: |
+          staging_image=$(kubectl -n "$KUBE_NAMESPACE" get deployment "$STAGING_RELEASE-mlops-search" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+          expected="$IMAGE_REPOSITORY@$IMAGE_DIGEST"
+          echo "staging:  $staging_image"
+          echo "promote:  $expected"
+          [ "$staging_image" = "$expected" ] || { echo "::error::staging does not run the promoted digest"; exit 1; }
+
+      - name: Deploy production (same digest, no rebuild)
+        env:
+          RELEASE: ${{ env.PROD_RELEASE }}
+          ENVIRONMENT: production
+          RANKING_MODE: normal
+          BUILD_REVISION: ${{ github.sha }}
+          REPORT_DIR: reports/production
+          SMOKE_PORT: "18091"
+        run: ./scripts/deploy_release.sh
+
+      - name: Promotion evidence (both environments run one digest)
+        run: |
+          mkdir -p reports/production
+          {
+            for r in "$STAGING_RELEASE" "$PROD_RELEASE"; do
+              printf '%s\t%s\n' "$r" "$(kubectl -n "$KUBE_NAMESPACE" get deployment "$r-mlops-search" \
+                -o jsonpath='{.spec.template.spec.containers[0].image}')"
+            done
+          } | tee reports/production/deployment-images.txt
+          [ "$(cut -f2 reports/production/deployment-images.txt | sort -u | wc -l)" -eq 1 ] \
+            || { echo "::error::staging and production run different images"; exit 1; }
+          {
+            echo "### Promotion"
+            echo '```'
+            cat reports/production/deployment-images.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove kubeconfig
+        if: always()
+        run: rm -f "$RUNNER_TEMP/kubeconfig"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-evidence
+          path: reports/production/
